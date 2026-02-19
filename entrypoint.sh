@@ -3,10 +3,9 @@ set -e
 
 CONFIG_FILE="${APP_HOME}/config.yaml"
 
-# Priority 1: Use USERNAME/PASSWORD if both are provided
+# 1. إعداد ملف الإعدادات الأساسي
 if [ -n "${USERNAME}" ] && [ -n "${PASSWORD}" ]; then
   echo "--- Basic auth enabled: Creating config.yaml with provided credentials. ---"
-  
   cat <<EOT > ${CONFIG_FILE}
 dataRoot: ./data
 listen: true
@@ -98,7 +97,7 @@ openai:
 deepl:
   formality: default
 mistral:
-  enablePrefix: false
+  enabledPrefix: false
 ollama:
   keepAlive: -1
   batchSize: -1
@@ -108,64 +107,47 @@ claude:
 enableServerPlugins: true
 enableServerPluginsAutoUpdate: false
 EOT
-
-# Priority 2: Use CONFIG_YAML if provided (and username/password are not)
 elif [ -n "${CONFIG_YAML}" ]; then
   echo "--- Found CONFIG_YAML, creating config.yaml from environment variable. ---"
   printf '%s\n' "${CONFIG_YAML}" > ${CONFIG_FILE}
-
-# Priority 3: No config provided, let the app use its defaults
 else
     echo "--- No user/pass or CONFIG_YAML provided. App will use its default settings. ---"
 fi
 
-# --- BEGIN: Update SillyTavern Core at Runtime ---
-echo '--- Attempting to update SillyTavern Core from GitHub (staging branch) ---'
-if [ -d ".git" ] && [ "$(git rev-parse --abbrev-ref HEAD)" = "staging" ]; then
-  echo 'Existing staging branch found. Resetting and pulling latest changes...'
-  git reset --hard HEAD && \
-  git pull origin staging || echo 'WARN: git pull failed, continuing with code from build time.'
-  echo '--- SillyTavern Core update check finished. ---'
-else
-  echo 'WARN: .git directory not found or not on staging branch. Skipping runtime update. Code from build time will be used.'
+# 2. تحديث SillyTavern لأحدث نسخة (Staging) عند التشغيل
+echo '--- Updating SillyTavern Core (Staging Branch) ---'
+if [ -d ".git" ]; then
+  git reset --hard HEAD && git pull origin staging || echo 'WARN: Update failed.'
 fi
-# --- END: Update SillyTavern Core at Runtime ---
 
-# --- BEGIN: Configure Git default identity at Runtime ---
-echo '--- Configuring Git default user identity at runtime ---'
-git config --global user.name "SillyTavern Sync" && \
-git config --global user.email "sillytavern-sync@example.com" && \
+# 3. إعداد هوية Git (ضرورية لعملية المزامنة)
+git config --global user.name "SillyTavern Sync"
+git config --global user.email "sillytavern-sync@example.com"
 git config --global --add safe.directory "${APP_HOME}/data"
-echo '--- Git identity configured for runtime user. ---'
-# --- END: Configure Git default identity at Runtime ---
 
-# --- BEGIN: Auto-Restore Data from Backup ---
+# 4. النظام الجديد: استعادة البيانات تلقائياً من الـ Backup
 if [ -n "${REPO_URL}" ] && [ -n "${GITHUB_TOKEN}" ]; then
-  echo "--- Checking for existing backup data in $REPO_URL ---"
+  echo "--- [RESTORE] Checking backup repository... ---"
   AUTH_REPO=$(echo "${REPO_URL}" | sed "s/https:\/\//https:\/\/x-access-token:${GITHUB_TOKEN}@/")
   
-  # التأكد من أن مجلد البيانات لا يحتوي على محادثات سابقة قبل السحب
+  # إذا لم يجد مجلد المحادثات، يقوم بالسحب فوراً
   if [ ! -d "${APP_HOME}/data/default-user/chats" ] || [ -z "$(ls -A ${APP_HOME}/data/default-user/chats 2>/dev/null)" ]; then
-    echo "Data directory is empty or fresh. Restoring from backup repository..."
+    echo "--- [RESTORE] Chats not found locally. Cloning from GitHub... ---"
     mkdir -p ${APP_HOME}/temp_restore
     if git clone --depth 1 "${AUTH_REPO}" ${APP_HOME}/temp_restore; then
-      cp -rn ${APP_HOME}/temp_restore/* ${APP_HOME}/data/ 2>/dev/null || true
+      cp -rf ${APP_HOME}/temp_restore/* ${APP_HOME}/data/ 2>/dev/null || true
       rm -rf ${APP_HOME}/temp_restore
-      echo "--- Restore from backup finished successfully. ---"
-    else
-      echo "WARN: Failed to clone backup. Moving on with fresh data."
-      rm -rf ${APP_HOME}/temp_restore
+      chown -R node:node ${APP_HOME}/data
+      echo "--- [RESTORE] Data successfully restored! ---"
     fi
   else
-    echo "Existing data detected in /data, skipping auto-restore to prevent overwrite."
+    echo "--- [RESTORE] Existing data detected, skipping restore to prevent overwrite. ---"
   fi
 fi
-# --- END: Auto-Restore Data from Backup ---
 
-# --- BEGIN: Dynamically Install Plugins at Runtime ---
-echo '--- Checking for PLUGINS environment variable ---'
+# 5. تثبيت الإضافات (Plugins) وإعداد الخزن السحابي
 if [ -n "$PLUGINS" ]; then
-  echo "*** Installing Plugins specified in PLUGINS environment variable: $PLUGINS ***"
+  echo "*** Installing Plugins: $PLUGINS ***"
   mkdir -p ./plugins && chown node:node ./plugins
   IFS=','
   for plugin_url in $PLUGINS; do
@@ -174,119 +156,66 @@ if [ -n "$PLUGINS" ]; then
     plugin_name_git=$(basename "$plugin_url")
     plugin_name=${plugin_name_git%.git}
     plugin_dir="./plugins/$plugin_name"
-    echo "--- Installing plugin: $plugin_name from $plugin_url into $plugin_dir ---"
+    
+    echo "--- Installing $plugin_name ---"
     rm -rf "$plugin_dir"
     git clone --depth 1 "$plugin_url" "$plugin_dir"
-    if [ -f "$plugin_dir/package.json" ]; then
-      echo "--- Installing dependencies for $plugin_name ---"
-      (cd "$plugin_dir" && npm install --no-audit --no-fund --loglevel=error --no-progress --omit=dev --force && npm cache clean --force) || echo "WARN: Failed to install dependencies for $plugin_name"
-    else
-       echo "--- No package.json found for $plugin_name, skipping dependency install. ---"
-    fi || echo "WARN: Failed to clone $plugin_name from $plugin_url, skipping..."
     
+    # إعداد إضافة الخزن السحابي تلقائياً
     if [ "$plugin_name" = "cloud-saves" ]; then
-      echo "--- Detected cloud-saves plugin, configuring... ---"
-      REPO_URL_VALUE=${REPO_URL:-"https://github.com/fuwei99/sillytravern"}
-      GITHUB_TOKEN_VALUE=${GITHUB_TOKEN:-""}
-      AUTOSAVE_INTERVAL_VALUE=${AUTOSAVE_INTERVAL:-10}
-      AUTOSAVE_TARGET_TAG_VALUE=${AUTOSAVE_TARGET_TAG:-"MySave"}
-      
-      AUTOSAVE_ENABLED="true"
-      
-      CONFIG_JSON_FILE="$plugin_dir/config.json"
-      cat <<EOT > ${CONFIG_JSON_FILE}
+      AUTOSAVE_TARGET_TAG_VALUE=${AUTOSAVE_TARGET_TAG:-"MySave"} # تم تثبيته على MySave لحل مشكلة الـ refspec
+      cat <<EOT > "$plugin_dir/config.json"
 {
-  "repo_url": "${REPO_URL_VALUE}",
+  "repo_url": "${REPO_URL}",
   "branch": "main",
   "username": "cloud-saves",
-  "github_token": "${GITHUB_TOKEN_VALUE}",
-  "display_name": "",
+  "github_token": "${GITHUB_TOKEN}",
   "is_authorized": true,
-  "last_save": null,
-  "current_save": null,
-  "has_temp_stash": false,
-  "autoSaveEnabled": ${AUTOSAVE_ENABLED},
-  "autoSaveInterval": ${AUTOSAVE_INTERVAL_VALUE},
+  "autoSaveEnabled": true,
+  "autoSaveInterval": ${AUTOSAVE_INTERVAL:-10},
   "autoSaveTargetTag": "${AUTOSAVE_TARGET_TAG_VALUE}"
 }
 EOT
-      chown node:node ${CONFIG_JSON_FILE}
-      echo "--- cloud-saves plugin configuration file created. ---"
+      chown node:node "$plugin_dir/config.json"
     fi
   done
   unset IFS
-  echo "--- Setting permissions for plugins directory ---"
   chown -R node:node ./plugins
-  echo "*** Plugin installation finished. ***"
-else
-  echo 'PLUGINS environment variable is empty, skipping.'
 fi
-# --- END: Dynamically Install Plugins at Runtime ---
 
-echo "*** Starting SillyTavern... ***"
+# 6. تشغيل السيرفر
+echo "*** Starting SillyTavern Server... ***"
 node ${APP_HOME}/server.js &
 SERVER_PID=$!
 
-echo "SillyTavern server started with PID ${SERVER_PID}."
-
-HEALTH_CHECK_URL="http://localhost:8000/"
-CURL_COMMAND="curl -sf"
-if [ -n "${USERNAME}" ] && [ -n "${PASSWORD}" ]; then
-    CURL_COMMAND="curl -sf -u \"${USERNAME}:${PASSWORD}\""
-fi
-
+# 7. فحص الجاهزية (Health Check)
 RETRY_COUNT=0
-MAX_RETRIES=12 
-while ! eval "${CURL_COMMAND} ${HEALTH_CHECK_URL}" > /dev/null; do
+while ! curl -sf http://localhost:8000/ > /dev/null; do
     RETRY_COUNT=$((RETRY_COUNT+1))
-    if [ ${RETRY_COUNT} -ge ${MAX_RETRIES} ]; then
-        echo "SillyTavern failed to start. Exiting."
-        kill ${SERVER_PID}
-        exit 1
-    fi
-    echo "SillyTavern is still starting, waiting 5 seconds..."
+    [ ${RETRY_COUNT} -ge 12 ] && exit 1
+    echo "Waiting for server (Attempt $RETRY_COUNT)..."
     sleep 5
 done
 
-echo "SillyTavern started successfully!"
+echo "SillyTavern is LIVE!"
 
-# --- BEGIN: Install Extensions after SillyTavern startup ---
-install_extensions() {
-    echo "--- Waiting 40 seconds before installing extensions... ---"
-    sleep 40
-    if [ -n "$EXTENSIONS" ]; then
-        echo "*** Installing Extensions... ***"
-        if [ "$INSTALL_FOR_ALL_USERS" = "true" ]; then
-            EXTENSIONS_DIR="./public/scripts/extensions/third-party"
-        else
-            EXTENSIONS_DIR="./data/default-user/extensions"
-        fi
-        mkdir -p "$EXTENSIONS_DIR" && chown node:node "$EXTENSIONS_DIR"
-        IFS=','
-        for extension_url in $EXTENSIONS; do
-            extension_url=$(echo "$extension_url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            if [ -z "$extension_url" ]; then continue; fi
-            extension_name_git=$(basename "$extension_url")
-            extension_name=${extension_name_git%.git}
-            extension_dir="$EXTENSIONS_DIR/$extension_name"
-            echo "--- Installing extension: $extension_name ---"
-            rm -rf "$extension_dir"
-            git clone --depth 1 "$extension_url" "$extension_dir"
-            if [ -f "$extension_dir/package.json" ]; then
-                (cd "$extension_dir" && npm install --no-audit --no-fund --loglevel=error --no-progress --omit=dev --force && npm cache clean --force)
-            fi
-        done
-        unset IFS
-        chown -R node:node "$EXTENSIONS_DIR"
-        echo "*** Extensions installation finished. ***"
-    fi
-}
-install_extensions &
-# --- END: Install Extensions after SillyTavern startup ---
-
-while kill -0 ${SERVER_PID} 2>/dev/null; do
-    eval "${CURL_COMMAND} ${HEALTH_CHECK_URL}" > /dev/null || echo "Keep-alive failed."
-    sleep 1800
-done &
+# 8. تثبيت الإضافات (Extensions) في الخلفية بعد التشغيل
+(
+  sleep 40
+  if [ -n "$EXTENSIONS" ]; then
+    EXTENSIONS_DIR="./data/default-user/extensions"
+    mkdir -p "$EXTENSIONS_DIR"
+    IFS=','
+    for ext in $EXTENSIONS; do
+      ext=$(echo "$ext" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      ext_name=$(basename "$ext" .git)
+      echo "--- Installing Extension: $ext_name ---"
+      rm -rf "$EXTENSIONS_DIR/$ext_name"
+      git clone --depth 1 "$ext" "$EXTENSIONS_DIR/$ext_name"
+    done
+    unset IFS
+    chown -R node:node "$EXTENSIONS_DIR"
+  fi
+) &
 
 wait ${SERVER_PID}
