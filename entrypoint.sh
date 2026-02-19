@@ -139,27 +139,43 @@ git config --global --add safe.directory "${APP_HOME}/data"
 echo '--- Git identity configured for runtime user. ---'
 # --- END: Configure Git default identity at Runtime ---
 
+# --- BEGIN: Auto-Restore Data from Backup ---
+if [ -n "${REPO_URL}" ] && [ -n "${GITHUB_TOKEN}" ]; then
+  echo "--- Checking for existing backup data in $REPO_URL ---"
+  AUTH_REPO=$(echo "${REPO_URL}" | sed "s/https:\/\//https:\/\/x-access-token:${GITHUB_TOKEN}@/")
+  
+  # التأكد من أن مجلد البيانات لا يحتوي على محادثات سابقة قبل السحب
+  if [ ! -d "${APP_HOME}/data/default-user/chats" ] || [ -z "$(ls -A ${APP_HOME}/data/default-user/chats 2>/dev/null)" ]; then
+    echo "Data directory is empty or fresh. Restoring from backup repository..."
+    mkdir -p ${APP_HOME}/temp_restore
+    if git clone --depth 1 "${AUTH_REPO}" ${APP_HOME}/temp_restore; then
+      cp -rn ${APP_HOME}/temp_restore/* ${APP_HOME}/data/ 2>/dev/null || true
+      rm -rf ${APP_HOME}/temp_restore
+      echo "--- Restore from backup finished successfully. ---"
+    else
+      echo "WARN: Failed to clone backup. Moving on with fresh data."
+      rm -rf ${APP_HOME}/temp_restore
+    fi
+  else
+    echo "Existing data detected in /data, skipping auto-restore to prevent overwrite."
+  fi
+fi
+# --- END: Auto-Restore Data from Backup ---
+
 # --- BEGIN: Dynamically Install Plugins at Runtime ---
 echo '--- Checking for PLUGINS environment variable ---'
 if [ -n "$PLUGINS" ]; then
   echo "*** Installing Plugins specified in PLUGINS environment variable: $PLUGINS ***"
-  # Ensure plugins directory exists
   mkdir -p ./plugins && chown node:node ./plugins
-  # Set comma as delimiter
   IFS=','
-  # Loop through each plugin URL
   for plugin_url in $PLUGINS; do
-    # Trim leading/trailing whitespace
     plugin_url=$(echo "$plugin_url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     if [ -z "$plugin_url" ]; then continue; fi
-    # Extract plugin name
     plugin_name_git=$(basename "$plugin_url")
     plugin_name=${plugin_name_git%.git}
     plugin_dir="./plugins/$plugin_name"
     echo "--- Installing plugin: $plugin_name from $plugin_url into $plugin_dir ---"
-    # Remove existing dir if it exists
     rm -rf "$plugin_dir"
-    # Clone the plugin (run as root, fix perms later)
     git clone --depth 1 "$plugin_url" "$plugin_dir"
     if [ -f "$plugin_dir/package.json" ]; then
       echo "--- Installing dependencies for $plugin_name ---"
@@ -168,22 +184,16 @@ if [ -n "$PLUGINS" ]; then
        echo "--- No package.json found for $plugin_name, skipping dependency install. ---"
     fi || echo "WARN: Failed to clone $plugin_name from $plugin_url, skipping..."
     
-    # Configure cloud-saves plugin if this is the cloud-saves plugin
     if [ "$plugin_name" = "cloud-saves" ]; then
-      echo "--- Detected cloud-saves plugin, checking for configuration environment variables ---"
-      
-      # Set default values
+      echo "--- Detected cloud-saves plugin, configuring... ---"
       REPO_URL_VALUE=${REPO_URL:-"https://github.com/fuwei99/sillytravern"}
       GITHUB_TOKEN_VALUE=${GITHUB_TOKEN:-""}
-      AUTOSAVE_INTERVAL_VALUE=${AUTOSAVE_INTERVAL:-10} # القيمة الافتراضية هنا 10 دقائق
-      AUTOSAVE_TARGET_TAG_VALUE=${AUTOSAVE_TARGET_TAG:-""}
+      AUTOSAVE_INTERVAL_VALUE=${AUTOSAVE_INTERVAL:-10}
+      AUTOSAVE_TARGET_TAG_VALUE=${AUTOSAVE_TARGET_TAG:-"MySave"}
       
       AUTOSAVE_ENABLED="true"
       
-      echo "--- Creating cloud-saves plugin configuration file ---"
       CONFIG_JSON_FILE="$plugin_dir/config.json"
-      
-      # Generate config.json file
       cat <<EOT > ${CONFIG_JSON_FILE}
 {
   "repo_url": "${REPO_URL_VALUE}",
@@ -200,21 +210,16 @@ if [ -n "$PLUGINS" ]; then
   "autoSaveTargetTag": "${AUTOSAVE_TARGET_TAG_VALUE}"
 }
 EOT
-      
-      # Set correct permissions for config file
       chown node:node ${CONFIG_JSON_FILE}
-      
-      echo "--- cloud-saves plugin configuration file created at: ${CONFIG_JSON_FILE} ---"
+      echo "--- cloud-saves plugin configuration file created. ---"
     fi
   done
-  # Reset IFS
   unset IFS
-  # Fix permissions for plugins directory after installation
   echo "--- Setting permissions for plugins directory ---"
   chown -R node:node ./plugins
   echo "*** Plugin installation finished. ***"
 else
-  echo 'PLUGINS environment variable is not set or empty, skipping runtime plugin installation.'
+  echo 'PLUGINS environment variable is empty, skipping.'
 fi
 # --- END: Dynamically Install Plugins at Runtime ---
 
@@ -222,23 +227,16 @@ echo "*** Starting SillyTavern... ***"
 node ${APP_HOME}/server.js &
 SERVER_PID=$!
 
-echo "SillyTavern server started with PID ${SERVER_PID}. Waiting for it to become responsive..."
+echo "SillyTavern server started with PID ${SERVER_PID}."
 
-# --- Health Check Logic ---
 HEALTH_CHECK_URL="http://localhost:8000/"
 CURL_COMMAND="curl -sf"
-
-# If basic auth is enabled, provide credentials to curl for health checks
 if [ -n "${USERNAME}" ] && [ -n "${PASSWORD}" ]; then
-    echo "--- Health check will use basic auth credentials. ---"
-    # The -u flag provides user:password for basic auth
     CURL_COMMAND="curl -sf -u \"${USERNAME}:${PASSWORD}\""
 fi
 
-# Health check loop
 RETRY_COUNT=0
-MAX_RETRIES=12 # Wait for 60 seconds max
-# Use eval to correctly execute the command string with quotes
+MAX_RETRIES=12 
 while ! eval "${CURL_COMMAND} ${HEALTH_CHECK_URL}" > /dev/null; do
     RETRY_COUNT=$((RETRY_COUNT+1))
     if [ ${RETRY_COUNT} -ge ${MAX_RETRIES} ]; then
@@ -246,90 +244,49 @@ while ! eval "${CURL_COMMAND} ${HEALTH_CHECK_URL}" > /dev/null; do
         kill ${SERVER_PID}
         exit 1
     fi
-    echo "SillyTavern is still starting or not responsive on port 8000, waiting 5 seconds..."
+    echo "SillyTavern is still starting, waiting 5 seconds..."
     sleep 5
 done
 
-echo "SillyTavern started successfully! Beginning periodic keep-alive..."
+echo "SillyTavern started successfully!"
 
 # --- BEGIN: Install Extensions after SillyTavern startup ---
 install_extensions() {
     echo "--- Waiting 40 seconds before installing extensions... ---"
     sleep 40
-    
-    echo "--- Checking for EXTENSIONS environment variable ---"
     if [ -n "$EXTENSIONS" ]; then
-        echo "*** Installing Extensions specified in EXTENSIONS environment variable: $EXTENSIONS ***"
-        
-        # Determine installation directory based on INSTALL_FOR_ALL_USERS
+        echo "*** Installing Extensions... ***"
         if [ "$INSTALL_FOR_ALL_USERS" = "true" ]; then
-            # System-level installation (for all users)
             EXTENSIONS_DIR="./public/scripts/extensions/third-party"
-            echo "Installing extensions for all users in: $EXTENSIONS_DIR"
         else
-            # User-level installation (for default user only)
             EXTENSIONS_DIR="./data/default-user/extensions"
-            echo "Installing extensions for default user in: $EXTENSIONS_DIR"
         fi
-        
-        # Ensure extensions directory exists
         mkdir -p "$EXTENSIONS_DIR" && chown node:node "$EXTENSIONS_DIR"
-        
-        # Set comma as delimiter
         IFS=','
-        
-        # Loop through each extension URL
         for extension_url in $EXTENSIONS; do
-            # Trim leading/trailing whitespace
             extension_url=$(echo "$extension_url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             if [ -z "$extension_url" ]; then continue; fi
-            
-            # Extract extension name
             extension_name_git=$(basename "$extension_url")
             extension_name=${extension_name_git%.git}
             extension_dir="$EXTENSIONS_DIR/$extension_name"
-            
-            echo "--- Installing extension: $extension_name from $extension_url into $extension_dir ---"
-            
-            # Remove existing dir if it exists
+            echo "--- Installing extension: $extension_name ---"
             rm -rf "$extension_dir"
-            
-            # Clone the extension
             git clone --depth 1 "$extension_url" "$extension_dir"
-            
-            # Check if extension has package.json and install dependencies if needed
             if [ -f "$extension_dir/package.json" ]; then
-                echo "--- Installing dependencies for $extension_name ---"
-                (cd "$extension_dir" && npm install --no-audit --no-fund --loglevel=error --no-progress --omit=dev --force && npm cache clean --force) || echo "WARN: Failed to install dependencies for $extension_name"
-            else
-                echo "--- No package.json found for $extension_name, skipping dependency install. ---"
-            fi || echo "WARN: Failed to clone $extension_name from $extension_url, skipping..."
+                (cd "$extension_dir" && npm install --no-audit --no-fund --loglevel=error --no-progress --omit=dev --force && npm cache clean --force)
+            fi
         done
-        
-        # Reset IFS
         unset IFS
-        
-        # Fix permissions for extensions directory after installation
-        echo "--- Setting permissions for extensions directory ---"
         chown -R node:node "$EXTENSIONS_DIR"
-        
         echo "*** Extensions installation finished. ***"
-    else
-        echo 'EXTENSIONS environment variable is not set or empty, skipping extensions installation.'
     fi
 }
-
-# Run the extension installation in the background
 install_extensions &
 # --- END: Install Extensions after SillyTavern startup ---
 
-# Keep-alive loop
 while kill -0 ${SERVER_PID} 2>/dev/null; do
-    echo "Sending keep-alive request to ${HEALTH_CHECK_URL}"
-    # Use eval here as well for the keep-alive command
-    eval "${CURL_COMMAND} ${HEALTH_CHECK_URL}" > /dev/null || echo "Keep-alive request failed."
-    echo "Keep-alive request sent. Sleeping for 30 minutes."
+    eval "${CURL_COMMAND} ${HEALTH_CHECK_URL}" > /dev/null || echo "Keep-alive failed."
     sleep 1800
 done &
 
-wait ${SERVER_PID} 
+wait ${SERVER_PID}
