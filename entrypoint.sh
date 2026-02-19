@@ -175,11 +175,10 @@ if [ -n "$PLUGINS" ]; then
       # Set default values
       REPO_URL_VALUE=${REPO_URL:-"https://github.com/fuwei99/sillytravern"}
       GITHUB_TOKEN_VALUE=${GITHUB_TOKEN:-""}
-      AUTOSAVE_INTERVAL_VALUE=${AUTOSAVE_INTERVAL:-30}
+      AUTOSAVE_INTERVAL_VALUE=${AUTOSAVE_INTERVAL:-10} # القيمة الافتراضية هنا 10 دقائق
       AUTOSAVE_TARGET_TAG_VALUE=${AUTOSAVE_TARGET_TAG:-""}
       
-      # Always set autosave to false as required
-      AUTOSAVE_ENABLED="false"
+      AUTOSAVE_ENABLED="true"
       
       echo "--- Creating cloud-saves plugin configuration file ---"
       CONFIG_JSON_FILE="$plugin_dir/config.json"
